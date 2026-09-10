@@ -2,6 +2,12 @@
 
 A reusable Python framework for measuring how **context window composition** (signal-to-noise ratio, item position, type routing) affects LLM extraction quality.
 
+> **Paper:** this harness is the confirmatory-trial engine behind *"Token Optimization and Context
+> Window Management in Multi-Agent AI Workflows"* — [arXiv:2608.17188](https://arxiv.org/abs/2608.17188)
+> (also archived on [Zenodo](https://doi.org/10.5281/zenodo.21924612)). The 2,420-trial factorial study
+> and the relevance-contrast finding (+0.077 relevance accuracy, 50:50 signal:noise vs. 100% signal)
+> reported there were produced by the `factorial` mode below.
+
 ## What This Is
 
 This harness lets you:

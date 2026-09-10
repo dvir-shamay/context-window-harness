@@ -134,4 +134,4 @@ See [DATA_SCHEMA.md](DATA_SCHEMA.md) for the complete CSV format specification. 
 
 ## License
 
-MIT
+MIT © Dvir Shamay

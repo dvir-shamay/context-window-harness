@@ -225,13 +225,44 @@ class ContextArranger:
 
         batches: list[Batch] = []
         batch_id = 1
+        orphaned_noise: list[Item] = []
 
         for type_label, (sig, noi) in groups.items():
             if not sig and not noi:
                 continue
+            if not sig:
+                # No item in this group scored as signal, so there's nothing to
+                # anchor its noise to - don't silently drop it (see the WARNING
+                # + "leftover" batch below).
+                orphaned_noise.extend(noi)
+                continue
             type_batches = self._build_batches(type_label, sig, noi, batch_id_start=batch_id)
             batches.extend(type_batches)
             batch_id += len(type_batches)
+
+        if orphaned_noise:
+            shown_ids = ", ".join(i.id for i in orphaned_noise[:10])
+            if len(orphaned_noise) > 10:
+                shown_ids += f", ... (+{len(orphaned_noise) - 10} more)"
+            plan_notes.append(
+                f"WARNING: {len(orphaned_noise)}/{len(items)} input item(s) scored "
+                f"below signal_threshold={self.signal_threshold} and had no same-type "
+                f"item score above it either: [{shown_ids}]. Placed in a 'leftover' "
+                "batch below instead of being silently dropped."
+            )
+            batches.append(Batch(
+                batch_id=batch_id,
+                item_type="leftover",
+                items=orphaned_noise,
+                signal_count=0,
+                noise_count=len(orphaned_noise),
+                strategy_notes=[
+                    "No item here scored above signal_threshold, and none shared a "
+                    "type with anything that did - grouped as-is so nothing from "
+                    "your input silently disappears.",
+                ],
+            ))
+            batch_id += 1
 
         total_sig = sum(b.signal_count for b in batches)
         total_noi = sum(b.noise_count for b in batches)
@@ -249,6 +280,9 @@ class ContextArranger:
 
     def _build_batches(self, type_label, signal, noise, batch_id_start):
         if not signal:
+            # Defensive guard only: arrange() now intercepts empty-signal groups
+            # before calling this method and routes their noise into a
+            # "leftover" batch instead - this branch should be unreachable.
             return []
 
         target_noise = min(
@@ -262,13 +296,22 @@ class ContextArranger:
         if total <= self.max_batch_size:
             return [self._make_batch(batch_id_start, type_label, signal, selected_noise)]
 
+        # Noise is consumed WITHOUT replacement across chunks. The previous
+        # "rotate" (noise = noise[n:] + noise[:n]) always summed back to the
+        # same pool size instead of shrinking, so it silently re-showed the
+        # same noise items in more than one batch once total demand across
+        # chunks exceeded the pool size.
         chunks = []
         chunk_size = self.max_batch_size // 2
         sig_chunks = _chunk_list(signal, chunk_size)
+        noise_remaining = list(noise)
         for k, sig_chunk in enumerate(sig_chunks):
-            noise_for_chunk = int(math.ceil(len(sig_chunk) * self.target_noise_ratio))
-            noise_chunk = noise[:noise_for_chunk]
-            noise = noise[noise_for_chunk:] + noise[:noise_for_chunk]
+            noise_for_chunk = min(
+                int(math.ceil(len(sig_chunk) * self.target_noise_ratio)),
+                len(noise_remaining),
+            )
+            noise_chunk = noise_remaining[:noise_for_chunk]
+            noise_remaining = noise_remaining[noise_for_chunk:]
             chunks.append(self._make_batch(batch_id_start + k, type_label, sig_chunk, noise_chunk))
         return chunks
 
@@ -361,26 +404,30 @@ def _heuristic_relevance(content: str, subject: str = "") -> float:
 
 
 def _group_by_type(signal, noise):
+    """Group signal and noise by item_type, pairing noise from the SAME type only.
+
+    Noise is never borrowed across types: doing so would silently change what
+    a "meeting" (etc.) batch actually contains, and could let the same noise
+    item be reused in two different type batches at once (it stays in its
+    native type's pool too), duplicating it across LLM calls. Signal-empty
+    groups are kept (not filtered out) so arrange() can route their noise into
+    a "leftover" batch instead of silently dropping it.
+    """
     type_order = ["meeting", "email", "chat", "other"]
     all_types = set(i.item_type for i in signal + noise)
     ordered_types = [t for t in type_order if t in all_types] + \
                     [t for t in all_types if t not in type_order]
 
-    groups = {}
     noise_by_type: dict[str, list[Item]] = {}
     for item in noise:
         noise_by_type.setdefault(item.item_type, []).append(item)
 
+    groups = {}
     for t in ordered_types:
         t_signal = [i for i in signal if i.item_type == t]
-        if not t_signal:
+        t_noise = noise_by_type.get(t, [])
+        if not t_signal and not t_noise:
             continue
-        t_noise = list(noise_by_type.get(t, []))
-        if len(t_noise) < len(t_signal):
-            for other_type in ordered_types:
-                if other_type == t:
-                    continue
-                t_noise.extend(noise_by_type.get(other_type, []))
         groups[t] = (t_signal, t_noise)
 
     return groups
@@ -402,8 +449,12 @@ def _load_items_from_json(path: str) -> list[Item]:
     """
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
+    if not isinstance(raw, list):
+        raise ValueError(f"expected a JSON list of item objects, got {type(raw).__name__}")
     items = []
-    for obj in raw:
+    for idx, obj in enumerate(raw):
+        if not isinstance(obj, dict):
+            raise ValueError(f"item at index {idx} is a {type(obj).__name__}, expected a JSON object")
         items.append(Item(
             id=str(obj.get("id", obj.get("item_id", "?"))),
             content=obj.get("content", ""),
@@ -479,7 +530,17 @@ Examples:
         items = _demo_items()
         print("Running on built-in demo items (11 items across meeting/email/chat).\n")
     elif args.input:
-        items = _load_items_from_json(args.input)
+        try:
+            items = _load_items_from_json(args.input)
+        except FileNotFoundError:
+            print(f"Error: input file not found: {args.input}", file=sys.stderr)
+            sys.exit(1)
+        except json.JSONDecodeError as exc:
+            print(f"Error: {args.input} is not valid JSON: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except ValueError as exc:
+            print(f"Error: {args.input} has the wrong shape: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"Loaded {len(items)} items from {args.input}\n")
     else:
         parser.print_help()

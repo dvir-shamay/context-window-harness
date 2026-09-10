@@ -1,0 +1,22 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Results (outputs only — never commit experiment results)
+experiment/results/
+
+# Data files (users supply their own)
+data/*.csv
+data/chats/
+
+# OS
+.DS_Store
+Thumbs.db
